@@ -3,9 +3,11 @@ use std::marker::PhantomData;
 use halo2_proofs::{
     arithmetic::FieldExt,
     circuit::{AssignedCell, Chip, Layouter, Region, SimpleFloorPlanner, Value},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance, Selector},
-    poly::Rotation,
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance, Selector, create_proof, keygen_vk, keygen_pk, verify_proof},
+    poly::{Rotation, ipa::{commitment::{IPACommitmentScheme, ParamsIPA}, multiopen::{ProverIPA, VerifierIPA}}, commitment::ParamsProver}, transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer},
 };
+use halo2curves::pasta::EqAffine;
+use rand_core::OsRng;
 
 // ANCHOR: instructions
 trait NumericInstructions<F: FieldExt>: Chip<F> {
@@ -328,6 +330,33 @@ fn main() {
     // of the instance column, so we position it there in our public inputs.
     let mut public_inputs = vec![c];
 
+    let params: ParamsIPA<EqAffine> = ParamsIPA::new(k);
+    let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
+    let pk = keygen_pk(&params, vk, &circuit).expect("keygen_pk should not fail");
+    let rng = OsRng;
+
+    let mut transcript = Blake2bWrite::<_, _, Challenge255<EqAffine>>::init(vec![]);
+    create_proof::<IPACommitmentScheme<EqAffine>, ProverIPA<EqAffine>, _, _, _, _>(
+        &params,
+        &pk,
+        &[circuit],
+        &[&[&public_inputs]],
+        rng,
+        &mut transcript,
+    )
+    .expect("proof generation should not fail");
+
+    /*
+    if let Ok(result) = verify_proof::<IPACommitmentScheme<EqAffine>, VerifierIPA<EqAffine>, _, _, _>(&params, &vk, strategy, &[&[&public_inputs]], &mut transcript) {
+
+    } else {
+        print!("Error");
+    }
+    */
+    
+    transcript.finalize();
+
+    /*
     // Given the correct public input, our circuit will verify.
     let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
     assert_eq!(prover.verify(), Ok(()));
@@ -337,4 +366,5 @@ fn main() {
     let prover = MockProver::run(k, &circuit, vec![public_inputs]).unwrap();
     assert!(prover.verify().is_err());
     // ANCHOR_END: test-circuit
+    */
 }

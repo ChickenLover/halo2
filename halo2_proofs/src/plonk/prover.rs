@@ -8,6 +8,8 @@ use std::ops::RangeTo;
 use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 use std::{collections::HashMap, iter, mem, sync::atomic::Ordering};
+use std::time::{Duration};
+
 
 use super::{
     circuit::{
@@ -18,6 +20,7 @@ use super::{
     lookup, permutation, vanishing, ChallengeBeta, ChallengeGamma, ChallengeTheta, ChallengeX,
     ChallengeY, Error, Expression, ProvingKey,
 };
+use crate::PEAK_ALLOC;
 use crate::{
     arithmetic::{eval_polynomial, CurveAffine, FieldExt},
     circuit::Value,
@@ -54,6 +57,9 @@ pub fn create_proof<
     mut rng: R,
     transcript: &mut T,
 ) -> Result<(), Error> {
+    let start_mem = PEAK_ALLOC.current_usage_as_mb();
+    let global_mem_start = start_mem;
+
     for instance in instances.iter() {
         if instance.len() != pk.vk.cs.num_instance_columns {
             return Err(Error::InvalidInstances);
@@ -67,6 +73,9 @@ pub fn create_proof<
     let mut meta = ConstraintSystem::default();
     let config = ConcreteCircuit::configure(&mut meta);
 
+    let cur_mem = PEAK_ALLOC.current_usage_as_mb() - start_mem;
+    println!("RAM change at setup: {}mb", cur_mem);
+
     // Selector optimizations cannot be applied here; use the ConstraintSystem
     // from the verification key.
     let meta = &pk.vk.cs;
@@ -75,6 +84,9 @@ pub fn create_proof<
         pub instance_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
         pub instance_polys: Vec<Polynomial<C::Scalar, Coeff>>,
     }
+
+    let start = Instant::now();
+    let start_mem = PEAK_ALLOC.current_usage_as_mb();
 
     let instance: Vec<InstanceSingle<Scheme::Curve>> = instances
         .iter()
@@ -130,6 +142,12 @@ pub fn create_proof<
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+
+    let cur_mem = PEAK_ALLOC.current_usage_as_mb() - start_mem;
+    println!("RAM change at instance transformations: {}mb", cur_mem);
+    
+    let duration = start.elapsed();
+    println!("Time in instance transformations: {:?}", duration);
 
     #[derive(Clone)]
     struct AdviceSingle<C: CurveAffine, B: Basis> {
@@ -281,6 +299,8 @@ pub fn create_proof<
         }
     }
 
+    
+    let start = Instant::now();
     let (advice, challenges) = {
         let mut advice = vec![
             AdviceSingle::<Scheme::Curve, LagrangeCoeff> {
@@ -293,6 +313,7 @@ pub fn create_proof<
 
         let unusable_rows_start = params.n() as usize - (meta.blinding_factors() + 1);
         for current_phase in pk.vk.cs.phases() {
+            println!("Current phase: {:?}", current_phase);
             let column_indices = meta
                 .advice_column_phase
                 .iter()
@@ -305,6 +326,7 @@ pub fn create_proof<
                     }
                 })
                 .collect::<BTreeSet<_>>();
+            println!("Column indices: {:?}", column_indices);
 
             for ((circuit, advice), instances) in
                 circuits.iter().zip(advice.iter_mut()).zip(instances)
@@ -330,6 +352,7 @@ pub fn create_proof<
                     config.clone(),
                     meta.constants.clone(),
                 )?;
+
 
                 let mut advice_values = batch_invert_assigned::<Scheme::Scalar>(
                     witness
@@ -400,9 +423,13 @@ pub fn create_proof<
         (advice, challenges)
     };
 
+    let duration = start.elapsed();
+    println!("Time in witness collection: {:?}", duration);
+
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: ChallengeTheta<_> = transcript.squeeze_challenge_scalar();
 
+    let start = Instant::now();
     let lookups: Vec<Vec<lookup::prover::Permuted<Scheme::Curve>>> = instance
         .iter()
         .zip(advice.iter())
@@ -430,12 +457,16 @@ pub fn create_proof<
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let duration = start.elapsed();
+    println!("Time in lookups1: {:?}", duration);
+
     // Sample beta challenge
     let beta: ChallengeBeta<_> = transcript.squeeze_challenge_scalar();
 
     // Sample gamma challenge
     let gamma: ChallengeGamma<_> = transcript.squeeze_challenge_scalar();
 
+    let start = Instant::now();
     // Commit to permutations.
     let permutations: Vec<permutation::prover::Committed<Scheme::Curve>> = instance
         .iter()
@@ -467,8 +498,14 @@ pub fn create_proof<
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let duration = start.elapsed();
+    println!("Time in permutations + lookups commitments: {:?}", duration);
+
+    let start = Instant::now();
     // Commit to the vanishing argument's random polynomial for blinding h(x_3)
     let vanishing = vanishing::Argument::commit(params, domain, &mut rng, transcript)?;
+    let duration = start.elapsed();
+    println!("Time in commiting to vanishing argument: {:?}", duration);
 
     // Obtain challenge for keeping all separate gates linearly independent
     let y: ChallengeY<_> = transcript.squeeze_challenge_scalar();
@@ -492,6 +529,7 @@ pub fn create_proof<
         )
         .collect();
 
+    let start = Instant::now();
     // Evaluate the h(X) polynomial
     let h_poly = pk.ev.evaluate_h(
         pk,
@@ -511,9 +549,14 @@ pub fn create_proof<
         &lookups,
         &permutations,
     );
+    let duration = start.elapsed();
+    println!("Time in evaluate_h: {:?}", duration);
 
+    let start = Instant::now();
     // Construct the vanishing argument's h(X) commitments
     let vanishing = vanishing.construct(params, domain, h_poly, &mut rng, transcript)?;
+    let duration = start.elapsed();
+    println!("Time in commiting to h(X): {:?}", duration);
 
     let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
     let xn = x.pow(&[params.n() as u64, 0, 0, 0]);
@@ -645,7 +688,12 @@ pub fn create_proof<
         .chain(vanishing.open(x));
 
     let prover = P::new(params);
-    prover
+    let result = prover
         .create_proof(rng, transcript, instances)
-        .map_err(|_| Error::ConstraintSystemFailure)
+        .map_err(|_| Error::ConstraintSystemFailure);
+
+    let cur_mem_global = PEAK_ALLOC.current_usage_as_mb() - global_mem_start;
+    println!("RAM change at whole create_proof: {}mb", cur_mem_global);
+
+    result
 }
